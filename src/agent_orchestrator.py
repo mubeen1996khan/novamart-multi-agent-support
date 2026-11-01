@@ -818,13 +818,31 @@ def build_communication_agent() -> Agent:
     and composing a coherent, empathetic response.
     """
 
-    # TODO: Create a BedrockModel
-    pass
+    # Temperature 0.3: the highest in the system - natural, warm wording
+    # benefits from a little variety; facts still come only from the context.
+    model = BedrockModel(
+        model_id=config.WORKER_MODEL_ID,
+        temperature=0.3,
+        region_name=config.AWS_REGION,
+    )
 
-    # TODO: System prompt for the Communication Agent
-    pass
+    system_prompt = """You are NovaMart's CommunicationAgent. You write the final reply the customer will read.
 
-    # TODO: Implement get_full_workflow_context
+How to work:
+1. Call get_full_workflow_context with the session ID, exactly once. It holds everything the specialist agents found: inventory_agent (order and account facts), refund_agent (eligibility decision), policy_agent (policy answer).
+2. Write the reply from those findings and the customer's original message.
+
+Content rules:
+- Include every relevant finding: the decision and the reason behind it (with the numbers, e.g. "your order is 12 days old and Premium members have 60 days"), return reference numbers, refund amounts, timelines and next steps, and the specific policy terms.
+- Use only facts from the workflow context. Never invent order details, references, amounts or policy terms, and never promise anything the context does not support.
+- If a specialist could not find something, say so kindly and tell the customer what to share to move forward.
+- Calculation questions (no specialist findings): work it out yourself step by step. Keep full precision until the end, then round money to the cent (half up) only once. Example: 5 x $29.99 = $149.95; 10% off is $14.995; total $134.955, which rounds to $134.96.
+- Do not mention internal agents, tools, databases, session IDs or "workflow".
+- Do not include email addresses, phone numbers or payment card numbers. Point the customer to "NovaMart Support in the Help Center" instead.
+
+Style: warm, professional and empathetic. Greet the customer by first name if it is known. Keep it under about 180 words, in short paragraphs; a short bullet list is fine for steps. Plain text only."""
+
+    # ── Context tool: the whole WorkflowState record for this session ──
     @tool
     def get_full_workflow_context(session_id: str) -> dict:
         """
@@ -836,10 +854,23 @@ def build_communication_agent() -> Agent:
         Returns:
             Full WorkflowState dict (inventory_agent, policy_agent, refund_agent)
         """
-        pass
+        state = _read_workflow_state(session_id.strip())
+        if not state:
+            return {'session_id': session_id, 'note': 'No workflow state found for this session.'}
+        # ttl is DynamoDB housekeeping - the model does not need it
+        context = _to_plain({k: v for k, v in state.items() if k != 'ttl'})
+        # Make skipped agents explicit, so the model never guesses what they "would" say
+        for column in ('inventory_agent', 'policy_agent', 'refund_agent'):
+            context.setdefault(column, 'not run for this request')
+        return context
 
-    # TODO: Instantiate and return the Agent
-    pass
+    return Agent(
+        name='CommunicationAgent',
+        model=model,
+        system_prompt=system_prompt,
+        tools=[get_full_workflow_context],
+    )
+    
 
 
 # ───────────────────────────────────────────────────────
