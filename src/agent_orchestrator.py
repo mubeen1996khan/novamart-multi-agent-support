@@ -624,28 +624,32 @@ def build_policy_agent() -> Agent:
     the combined results into a complete, grounded policy answer.
     """
 
-    # TODO: Build ReturnsPolicyRetrieverAgent
+    # ── Retriever sub-agents ───────────────────────────────────────────
+    # One retriever per Knowledge Base. Each is a full Strands Agent with a
+    # single tool, so the three can run in parallel and fail independently.
+
+    # Separate model object per retriever: threads should not share one.
     def _retriever_model() -> BedrockModel:
         # temperature 0.0 - retrieval must be deterministic
         return BedrockModel(model_id=config.WORKER_MODEL_ID, temperature=0.0,
                             region_name=config.AWS_REGION)
 
+    # ── Returns KB retriever ──
     @tool
     def retrieve_returns_policy(query: str) -> str:
-        """Retrieve relevant passages from the Returns Policy knowledge base.
+        """
+        Retrieve relevant passages from the Returns Policy knowledge base.
 
-         Args:
+        Args:
             query: The policy question to search for
 
         Returns:
             Top matching passages with relevance scores and S3 sources
         """
-        
-        
-
-    # Create the ReturnsPolicyRetrieverAgent with the tool above
         return format_kb_results(retrieve_from_knowledge_base(config.RETURNS_KB_ID, query))
 
+    # ReturnsPolicyRetrieverAgent: copies passages from the Returns KB
+    # verbatim - it never answers, so nothing is lost or invented here.
     returns_retriever = Agent(
         name='ReturnsPolicyRetrieverAgent',
         model=_retriever_model(),
@@ -653,21 +657,21 @@ def build_policy_agent() -> Agent:
         tools=[retrieve_returns_policy],
     )
 
-    # TODO: Build ShippingPolicyRetrieverAgent
+    # ── Shipping KB retriever ──
     @tool
     def retrieve_shipping_policy(query: str) -> str:
-        """Retrieve relevant passages from the Shipping Policy knowledge base.
+        """
+        Retrieve relevant passages from the Shipping Policy knowledge base.
 
         Args:
             query: The policy question to search for
 
         Returns:
-            Top matching passages with relevance scores and S3 sources"""
-        
-
-    # Create the ShippingPolicyRetrieverAgent with the tool above
+            Top matching passages with relevance scores and S3 sources
+        """
         return format_kb_results(retrieve_from_knowledge_base(config.SHIPPING_KB_ID, query))
 
+    # ShippingPolicyRetrieverAgent: same pattern, Shipping KB.
     shipping_retriever = Agent(
         name='ShippingPolicyRetrieverAgent',
         model=_retriever_model(),
@@ -675,7 +679,7 @@ def build_policy_agent() -> Agent:
         tools=[retrieve_shipping_policy],
     )
 
-    # TODO: Build WarrantyPolicyRetrieverAgent
+    # ── Warranty KB retriever ──
     @tool
     def retrieve_warranty_policy(query: str) -> str:
         """
@@ -687,9 +691,9 @@ def build_policy_agent() -> Agent:
         Returns:
             Top matching passages with relevance scores and S3 sources
         """
-    # Create the WarrantyPolicyRetrieverAgent with the tool above
         return format_kb_results(retrieve_from_knowledge_base(config.WARRANTY_KB_ID, query))
 
+    # WarrantyPolicyRetrieverAgent: same pattern, Warranty KB.
     warranty_retriever = Agent(
         name='WarrantyPolicyRetrieverAgent',
         model=_retriever_model(),
@@ -697,7 +701,9 @@ def build_policy_agent() -> Agent:
         tools=[retrieve_warranty_policy],
     )
 
-    # TODO: Implement search_all_policies - parallel RAG retrieval tool
+    # ── Parallel fan-out tool (the PolicyAgent's only tool) ────────────
+    # Runs the three retrievers at the same time (~3s instead of ~9s) and
+    # keeps partial results if one Knowledge Base fails.
     @tool
     def search_all_policies(query: str) -> str:
         """
@@ -712,53 +718,94 @@ def build_policy_agent() -> Agent:
         Returns:
             Combined policy passages from all three knowledge bases
         """
-        # Build a dict mapping domain names to their retriever agents
-        # e.g. {'Returns': returns_retriever, 'Shipping': shipping_retriever, ...}
-
-        # ── Trace: show parallel KB dispatch to learners ──────────────────
-        trace.kb_start({
+        # Domain -> retriever sub-agent, and domain -> KB id (for the trace and headers)
+        retrievers = {
+            'Returns':  returns_retriever,
+            'Shipping': shipping_retriever,
+            'Warranty': warranty_retriever,
+        }
+        kb_ids = {
             'Returns':  config.RETURNS_KB_ID,
             'Shipping': config.SHIPPING_KB_ID,
             'Warranty': config.WARRANTY_KB_ID,
-        })
+        }
 
-        # Define a helper to run one retriever sub-agent
+        # ── Trace: show parallel KB dispatch to learners ──────────────────
+        trace.kb_start(kb_ids)
+
         def _run_retriever(domain: str, agent, query: str) -> tuple:
             """
             Run one retriever sub-agent and return (domain, result_text).
 
             stdout is suppressed globally for all threads by the
             _TraceWriter._suppress_parallel flag set in kb_start().
-            This covers both the direct worker thread and any internal
-            streaming child threads that Strands SDK spawns internally -
-            which do NOT inherit thread-local variables and therefore cannot
-            be suppressed with a thread-local capture approach.
             Results are returned as values and printed cleanly and
             sequentially by trace.kb_result() after all futures join.
             """
-            pass
+            text = _invoke_worker(f"{domain}PolicyRetriever", agent,
+                                  f"Retrieve {domain.lower()} policy passages relevant to: {query}")
+            return domain, text
 
-        # Use ThreadPoolExecutor to run all three retrievers in parallel
-        # Collect results into a dict: {'Returns': '...', 'Shipping': '...', ...}
+        # Submit all three at once; as_completed() yields each as soon as it finishes
+        results = {}
+        try:
+            with ThreadPoolExecutor(max_workers=3) as pool:
+                futures = {
+                    pool.submit(_run_retriever, domain, agent, query): domain
+                    for domain, agent in retrievers.items()
+                }
+                for future in as_completed(futures):
+                    domain = futures[future]
+                    try:
+                        _, text = future.result()
+                        results[domain] = text or f"No relevant {domain.lower()} policy passages found."
+                    except Exception as exc:          # one KB failing must not sink the others
+                        logger.warning("%s retriever failed: %s", domain, exc)
+                        results[domain] = f"[{domain} retrieval error: {exc}]"
+        finally:
+            # ── Trace: all KBs responded - print each result sequentially ─────
+            # (in finally, so terminal output is restored even after an error)
+            trace.kb_done(len(retrievers))
+        for domain in retrievers:
+            trace.kb_result(domain, results.get(domain, '[No results]'))
 
-        # ── Trace: all KBs responded - print each result sequentially ─────
-        # trace.kb_done(len(retrievers))
-        # for domain in ['Returns', 'Shipping', 'Warranty']:
-        #     trace.kb_result(domain, results.get(domain, '[No results]'))
+        # Fixed order with headers, so the coordinator knows where each passage came from
+        return "\n\n".join(
+            f"=== {domain.upper()} POLICY (Knowledge Base {kb_ids[domain] or 'not configured'}) ===\n"
+            f"{results.get(domain, '[No results]')}"
+            for domain in retrievers
+        )
 
-        # Combine results from all three domains and return
-        pass
+    # ── PolicyAgent coordinator ────────────────────────────────────────
+    # Temperature 0.2: a little freedom to combine passages into readable
+    # text, while every fact must still come from the retrieved passages.
+    model = BedrockModel(
+        model_id=config.WORKER_MODEL_ID,
+        temperature=0.2,
+        region_name=config.AWS_REGION,
+    )
 
-    # TODO: Create a BedrockModel for the PolicyAgent coordinator
-    pass
+    system_prompt = """You are the NovaMart PolicyAgent. You answer questions about NovaMart's return, shipping and warranty policies.
 
-    # TODO: System prompt for PolicyAgent coordinator
-    pass
+How to work:
+1. ALWAYS call search_all_policies first, exactly once, with the customer's question. It searches the Returns, Shipping and Warranty knowledge bases in parallel.
+2. Synthesize a grounded answer using ONLY the retrieved passages.
 
-    # TODO: Instantiate and return the PolicyAgent coordinator
-    pass
+Rules:
+- Every number (days, prices, durations) must come from a passage. Never invent or assume policy details.
+- When the rule differs by customer tier (Standard vs Premium), state the rule for the tier asked about; if no tier was given, state both.
+- Mention which policy area each point comes from (Returns, Shipping or Warranty). Ignore passages that are not relevant.
+- If the passages do not answer the question, say clearly which part is not covered.
+- You do not know anything about a specific customer's account or orders.
 
+Output: a concise, factual policy summary (bullet points are fine) for the CommunicationAgent to use."""
 
+    return Agent(
+        name='PolicyAgent',
+        model=model,
+        system_prompt=system_prompt,
+        tools=[search_all_policies],
+    )
 # ───────────────────────────────────────────────────────
 #  2.D - COMMUNICATION AGENT
 # ───────────────────────────────────────────────────────
