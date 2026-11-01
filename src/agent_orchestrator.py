@@ -849,9 +849,9 @@ Rules:
 - Mention which policy area each point comes from (Returns, Shipping or Warranty). Ignore passages that are not relevant.
 - If the passages do not answer the question, say clearly which part is not covered.
 - You do not know anything about a specific customer's account or orders.
+- If passages conflict, say so briefly and prefer the dedicated policy document (return_policy, shipping_policy, warranty_policy) over the general customer_tiers summary.
 
 Output: a concise, factual policy summary (bullet points are fine) for the CommunicationAgent to use."""
-
     return Agent(
         name='PolicyAgent',
         model=model,
@@ -892,7 +892,8 @@ Content rules:
 - Do not mention internal agents, tools, databases, session IDs or "workflow".
 - Do not include email addresses, phone numbers or payment card numbers. Point the customer to "NovaMart Support in the Help Center" instead.
 
-Style: warm, professional and empathetic. Greet the customer by first name if it is known. Keep it under about 180 words, in short paragraphs; a short bullet list is fine for steps. Plain text only."""
+Style: warm, professional and empathetic. Greet the customer by first name if it is known. Keep it under about 180 words, in short paragraphs; a short numbered list is fine for steps. Plain text only: no markdown, no ** or # characters.
+"""
 
     # ── Context tool: the whole WorkflowState record for this session ──
     @tool
