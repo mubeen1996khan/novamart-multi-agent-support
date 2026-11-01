@@ -211,6 +211,15 @@ def _update_workflow_state(session_id: str, updates: dict,
 # ═══════════════════════════════════════════════════════
 #  SHARED HELPERS FOR THE WORKER AGENTS
 # ═══════════════════════════════════════════════════════
+# Return windows per customer tier (project specification)
+STANDARD_RETURN_WINDOW_DAYS = 30
+PREMIUM_RETURN_WINDOW_DAYS  = 60
+
+
+def _return_window_days(tier: str) -> int:
+    """Return window for a tier: Premium = 60 days, anything else = Standard 30 days."""
+    return PREMIUM_RETURN_WINDOW_DAYS if str(tier).strip().lower() == 'premium' \
+        else STANDARD_RETURN_WINDOW_DAYS
 
 def _to_plain(value):
     """Convert DynamoDB values (Decimal, sets) into JSON-friendly Python values."""
@@ -325,7 +334,31 @@ NOT FOUND (only if something was missing)
         Returns:
             Customer profile including tier and account details
         """
-        pass
+        customer_id = customer_id.strip().upper()
+        try:
+            item = dynamodb.Table(config.CUSTOMERS_TABLE).get_item(
+                Key={'customer_id': customer_id}
+            ).get('Item')
+        except ClientError as exc:
+            return {'found': False, 'error': f"Customer lookup failed: {exc.response['Error']['Message']}"}
+
+        if not item:
+            return {'found': False, 'customer_id': customer_id,
+                    'message': f"No customer {customer_id} found."}
+
+        customer = _to_plain(item)
+        tier = customer.get('tier', 'Standard')
+        # Contact details (email) are left out on purpose: no agent needs them.
+        return {
+            'found':              True,
+            'customer_id':        customer_id,
+            'name':               customer.get('name'),
+            'tier':               tier,
+            'return_window_days': _return_window_days(tier),
+            'account_created':    customer.get('account_created'),
+            'total_orders':       customer.get('total_orders'),
+            'preferred_contact':  customer.get('preferred_contact'),
+        }
 
     # TODO: Implement list_customer_orders
     @tool
@@ -339,13 +372,39 @@ NOT FOUND (only if something was missing)
         Returns:
             List of all orders with order_id, status, order_date, and amount
         """
-        pass
+        customer_id = customer_id.strip().upper()
+        table = dynamodb.Table(config.ORDERS_TABLE)
+        items, kwargs = [], {'KeyConditionExpression': Key('customer_id').eq(customer_id)}
+        try:
+            while True:
+                page = table.query(**kwargs)
+                items.extend(page.get('Items', []))
+                if 'LastEvaluatedKey' not in page:
+                    break
+                kwargs['ExclusiveStartKey'] = page['LastEvaluatedKey']
+        except ClientError as exc:
+            return {'customer_id': customer_id, 'orders': [],
+                    'error': f"Order query failed: {exc.response['Error']['Message']}"}
+
+        orders = []
+        for item in sorted(items, key=lambda i: i.get('order_date', ''), reverse=True):
+            o = _to_plain(item)
+            orders.append({
+                'order_id':         o.get('order_id'),
+                'product_name':     o.get('product_name'),
+                'status':           o.get('status'),
+                'order_date':       o.get('order_date'),
+                'days_since_order': _days_since(o.get('order_date')),
+                'price':            o.get('price'),
+                'quantity':         o.get('quantity'),
+            })
+        return {'customer_id': customer_id, 'order_count': len(orders), 'orders': orders}
 
     return Agent(
         name='InventoryAgent',
         model=model,
         system_prompt=system_prompt,
-        tools=[check_order_status],
+        tools=[check_order_status, get_customer_tier, list_customer_orders],
     )
 
 # ───────────────────────────────────────────────────────
