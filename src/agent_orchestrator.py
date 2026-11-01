@@ -45,6 +45,8 @@ import uuid
 import logging
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
+from decimal import Decimal
 from typing import Optional
 
 # Ensure the parent directory is on sys.path so config.py and
@@ -206,7 +208,30 @@ def _update_workflow_state(session_id: str, updates: dict,
 
     raise RuntimeError("WorkflowState update: unexpected exit from retry loop")
 
+# ═══════════════════════════════════════════════════════
+#  SHARED HELPERS FOR THE WORKER AGENTS
+# ═══════════════════════════════════════════════════════
 
+def _to_plain(value):
+    """Convert DynamoDB values (Decimal, sets) into JSON-friendly Python values."""
+    if isinstance(value, list):
+        return [_to_plain(v) for v in value]
+    if isinstance(value, dict):
+        return {k: _to_plain(v) for k, v in value.items()}
+    if isinstance(value, set):
+        return sorted(_to_plain(v) for v in value)
+    if isinstance(value, Decimal):
+        return int(value) if value == value.to_integral_value() else float(value)
+    return value
+
+
+def _days_since(date_str: str) -> Optional[int]:
+    """Whole days between an ISO date (YYYY-MM-DD) and today (UTC). None if unparseable."""
+    try:
+        then = datetime.strptime(str(date_str)[:10], '%Y-%m-%d').date()
+    except (TypeError, ValueError):
+        return None
+    return (datetime.now(timezone.utc).date() - then).days
 # ═══════════════════════════════════════════════════════
 #  TASK 2 - MULTI-AGENT ORCHESTRATION
 # ═══════════════════════════════════════════════════════
@@ -224,16 +249,37 @@ def build_inventory_agent() -> Agent:
     only retrieves data for the OrchestratorAgent to share with downstream agents.
     """
 
-    # TODO: Create a BedrockModel using the WORKER model
-    pass
+    model = BedrockModel (
+        model_id=config.WORKER_MODEL_ID,
+        temperature=0.1,
+        region_name=config.AWS_REGION,
+    )
 
-    # TODO: System prompt for the Inventory Agent
-    pass
 
-    # TODO: Implement check_order_status
-    # NOTE: the Orders table has a COMPOSITE key (customer_id = partition key,
-    # order_id = sort key), so a get_item needs BOTH values. That is why this
-    # tool takes customer_id as well as order_id.
+    system_prompt = """You are the NovaMart InventoryAgent, a data gatherer for the customer support team.
+
+Your only job is to look up facts in NovaMart's order and customer databases and report them accurately.
+
+How to work:
+- The customer ID in the request header is authoritative. Only look up data for that customer.
+- If the request mentions an order ID (e.g. ORD-27176), call check_order_status with the customer ID and that order ID.
+- If the request is about orders but names no order ID, call list_customer_orders.
+- Call get_customer_tier whenever the request involves a return, a refund, an account or tier question.
+- If a record is not found, say so plainly. Never guess or invent data.
+
+Rules:
+- You NEVER decide return or refund eligibility, approve, deny or promise anything. Downstream agents make decisions.
+- Report facts only: order ID, product, status, order date, days since order, price, quantity, customer name and tier.
+
+Output format - a short factual report:
+FACTS
+- <fact>
+- <fact>
+NOT FOUND (only if something was missing)
+- <what was not found>
+"""
+
+    
     @tool
     def check_order_status(customer_id: str, order_id: str) -> dict:
         """
@@ -248,7 +294,23 @@ def build_inventory_agent() -> Agent:
             Order record (order_id, status, product_name, order_date, price, ...)
             or a not-found message
         """
-        pass
+        customer_id = customer_id.strip().upper()
+        order_id    = order_id.strip().upper()
+        try:
+            item = dynamodb.Table(config.ORDERS_TABLE).get_item(
+                Key={'customer_id': customer_id, 'order_id': order_id}
+            ).get('Item')
+        except ClientError as exc:
+            return {'found': False, 'error': f"Order lookup failed: {exc.response['Error']['Message']}"}
+
+        if not item:
+            return {'found': False, 'customer_id': customer_id, 'order_id': order_id,
+                    'message': f"No order {order_id} found for customer {customer_id}."}
+
+        order = _to_plain(item)
+        order['found'] = True
+        order['days_since_order'] = _days_since(order.get('order_date'))
+        return order
 
     # TODO: Implement get_customer_tier
     @tool
@@ -279,9 +341,12 @@ def build_inventory_agent() -> Agent:
         """
         pass
 
-    # TODO: Instantiate and return the Agent
-    pass
-
+    return Agent(
+        name='InventoryAgent',
+        model=model,
+        system_prompt=system_prompt,
+        tools=[check_order_status],
+    )
 
 # ───────────────────────────────────────────────────────
 #  2.B - REFUND AGENT
@@ -331,9 +396,10 @@ def build_refund_agent() -> Agent:
         """
         pass
 
+        
+
     # TODO: Instantiate and return the Agent
     pass
-
 
 # ───────────────────────────────────────────────────────
 #  2.C - POLICY AGENT - MULTI-AGENT RAG
