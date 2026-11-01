@@ -1362,21 +1362,34 @@ def deploy_to_agentcore_runtime(
     # Stage the code the CLI packages (src modules + config.py + pyproject.toml).
     agentcore_cli.stage_runtime_code()
 
-    # TODO: Configure and deploy the runtime with the AgentCore CLI
-    # 1. Build the runtime environment variables dict `runtime_env` with:
-    #      AWS_REGION, PROJECT_NAME (config.AWS_REGION / config.PROJECT_NAME),
-    #      RETURNS_KB_ID, SHIPPING_KB_ID, WARRANTY_KB_ID (from config),
-    #      AGENT_LOG_GROUP (config.AGENT_LOG_GROUP), and the guardrail
-    #      (GUARDRAIL_ID = guardrail_id, GUARDRAIL_VERSION = guardrail_version)
-    # 2. Write the runtime settings to agentcore/agentcore.json with
-    #      agentcore_cli.configure_runtime(env_vars=runtime_env,
-    #                                      network_mode='PUBLIC',
-    #                                      protocol='HTTP',
-    #                                      execution_role_arn=config.AGENTCORE_ROLE_ARN)
-    # 3. Deploy:  agentcore_cli.deploy()        (runs `agentcore deploy -y`)
-    # 4. Read the ARN the CLI recorded:
-    #      runtime_arn = agentcore_cli.deployed_runtime_arn()
-    runtime_arn = None
+     # TODO done: configure and deploy the runtime with the AgentCore CLI
+    # The deployed code has no .env file - everything it needs travels as
+    # runtime environment variables.
+    runtime_env = {
+        'AWS_REGION':        config.AWS_REGION,
+        'PROJECT_NAME':      config.PROJECT_NAME,
+        'RETURNS_KB_ID':     config.RETURNS_KB_ID,
+        'SHIPPING_KB_ID':    config.SHIPPING_KB_ID,
+        'WARRANTY_KB_ID':    config.WARRANTY_KB_ID,
+        'AGENT_LOG_GROUP':   config.AGENT_LOG_GROUP,
+        'GUARDRAIL_ID':      guardrail_id,
+        'GUARDRAIL_VERSION': guardrail_version,
+    }
+    missing = [k for k, v in runtime_env.items() if not v]
+    if missing:
+        print(f"  [Warning] {', '.join(missing)} not set - the runtime will start without them.")
+
+    # Write the settings to agentcore/agentcore.json, then let the CLI package
+    # build/runtime/ and create or update the runtime through CloudFormation.
+    agentcore_cli.configure_runtime(
+        env_vars=runtime_env,
+        network_mode='PUBLIC',
+        protocol='HTTP',
+        execution_role_arn=config.AGENTCORE_ROLE_ARN,
+    )
+    print("  Runtime settings written to agentcore/agentcore.json - running `agentcore deploy`")
+    agentcore_cli.deploy()
+    runtime_arn = agentcore_cli.deployed_runtime_arn()
 
     if not runtime_arn:
         raise NotImplementedError("deploy_to_agentcore_runtime: AgentCore CLI deployment not implemented")
@@ -1410,16 +1423,21 @@ def configure_memory(runtime_arn: str) -> str:
             print(f"AgentCore Memory already exists: {memory_arn}")
             return memory_arn
 
-    # TODO: Create AgentCore Memory
-    # Use agentcore_control.create_memory() with:
-    #   - name (memory_name) and a description
-    #   - eventExpiryDuration = 7   (days)
-    #   - memoryStrategies = [{'summaryMemoryStrategy': {
-    #         'name': 'SessionSummary',
-    #         'namespaces': ['/summaries/{actorId}/{sessionId}']}}]
-    #   - clientToken (e.g. str(uuid.uuid4())) for idempotency
-    # Store the API response in `response`.
-    response = None
+       # Create AgentCore Memory: session summaries per customer, 7-day retention
+    response = agentcore_control.create_memory(
+        name=memory_name,
+        description=('NovaMart customer support conversations - session summaries per customer '
+                     'and session, kept for 7 days.'),
+        eventExpiryDuration=7,
+        memoryStrategies=[{
+            'summaryMemoryStrategy': {
+                'name':        'SessionSummary',
+                'description': 'Summarises each customer support session (SESSION_SUMMARY strategy).',
+                'namespaces':  ['/summaries/{actorId}/{sessionId}'],
+            }
+        }],
+        clientToken=str(uuid.uuid4()),
+    )
 
     if response is None:
         raise NotImplementedError("configure_memory: create_memory() not implemented")
@@ -1457,18 +1475,25 @@ def configure_observability(runtime_arn: str) -> None:
                           sampling percentage; runtime env AGENT_TRACING_ENABLED /
                           AGENT_TRACE_SAMPLING_RATE
     """
-    # TODO: Build the logging configuration
-    # logging_configuration = {
-    #     'cloudWatchConfig': {'logGroupName': config.AGENT_LOG_GROUP,
-    #                          'logLevel': 'INFO', 'enabled': True},
-    #     'xRayConfig':       {'enabled': True, 'samplingRate': 1.0},
-    # }
-    # Then apply it:  summary = apply_observability_config(runtime_arn, logging_configuration)
-    # Wrap the call in try/except - on success print the CloudWatch log group
-    # and the X-Ray sampling rate; on exception print
-    #   "[Note] Observability configuration failed: <e>"
-
-    pass
+       # Build the logging configuration: CloudWatch Logs at INFO + X-Ray at 100% sampling
+    logging_configuration = {
+        'cloudWatchConfig': {
+            'logGroupName': config.AGENT_LOG_GROUP,
+            'logLevel':     'INFO',
+            'enabled':      True,
+        },
+        'xRayConfig': {
+            'enabled':      True,
+            'samplingRate': 1.0,       # trace every request (development setting)
+        },
+    }
+    try:
+        summary = apply_observability_config(runtime_arn, logging_configuration)
+        print(f"  CloudWatch Logs : {summary['log_group']} (level INFO)")
+        print(f"  X-Ray tracing   : enabled, sampling rate "
+              f"{logging_configuration['xRayConfig']['samplingRate']:.0%}")
+    except Exception as e:
+        print(f"  [Note] Observability configuration failed: {e}")
 
 
 # ═══════════════════════════════════════════════════════
