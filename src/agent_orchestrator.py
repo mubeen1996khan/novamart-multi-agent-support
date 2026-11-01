@@ -215,6 +215,15 @@ def _update_workflow_state(session_id: str, updates: dict,
 STANDARD_RETURN_WINDOW_DAYS = 30
 PREMIUM_RETURN_WINDOW_DAYS  = 60
 
+# Only delivered orders can be returned. Other statuses get a clear reason.
+_RETURNABLE_STATUSES = {'delivered'}
+_STATUS_REASONS = {
+    'processing':       'the order has not shipped yet, so it can be cancelled instead of returned',
+    'shipped':          'the order is still in transit; a return can be started once it is delivered',
+    'cancelled':        'the order was cancelled, so there is nothing to return',
+    'return_initiated': 'a return has already been started for this order',
+}
+
 
 def _return_window_days(tier: str) -> int:
     """Return window for a tier: Premium = 60 days, anything else = Standard 30 days."""
@@ -488,7 +497,81 @@ Use NOT_REQUESTED when the customer only asked about status or eligibility; stil
         Returns:
             Confirmation dict with return_reference number and instructions
         """
-        pass
+        customer_id = customer_id.strip().upper()
+        order_id    = order_id.strip().upper()
+        orders_table = dynamodb.Table(config.ORDERS_TABLE)
+
+        # 1. Load the real order and customer - never trust the model's numbers
+        order = orders_table.get_item(
+            Key={'customer_id': customer_id, 'order_id': order_id}).get('Item')
+        if not order:
+            return {'success': False, 'order_id': order_id,
+                    'reason': f"No order {order_id} found for customer {customer_id}."}
+        customer = dynamodb.Table(config.CUSTOMERS_TABLE).get_item(
+            Key={'customer_id': customer_id}).get('Item') or {}
+
+        tier   = customer.get('tier', 'Standard')
+        window = _return_window_days(tier)
+        age    = _days_since(order.get('order_date'))
+        status = str(order.get('status', '')).lower()
+
+        # 2. Re-check eligibility in code
+        if status == 'return_initiated':
+            return {'success': False, 'order_id': order_id,
+                    'return_reference': order.get('return_reference'),
+                    'reason': _STATUS_REASONS['return_initiated']}
+        if status not in _RETURNABLE_STATUSES:
+            return {'success': False, 'order_id': order_id, 'status': status,
+                    'reason': _STATUS_REASONS.get(status, f"orders with status '{status}' cannot be returned")}
+        if age is None or age > window:
+            return {'success': False, 'order_id': order_id, 'tier': tier,
+                    'return_window_days': window, 'days_since_order': age,
+                    'reason': f"the order is {age} days old, outside the {window}-day {tier} return window"}
+
+        # 3. Money with Decimal - never float for currency
+        refund_amount = (Decimal(str(order.get('price', '0'))) *
+                         Decimal(str(order.get('quantity', '1')))).quantize(Decimal('0.01'))
+        return_reference = f"RET-{uuid.uuid4().hex[:8].upper()}"
+
+        # 4. Conditional write: only succeeds if the status hasn't changed since we read it
+        try:
+            orders_table.update_item(
+                Key={'customer_id': customer_id, 'order_id': order_id},
+                UpdateExpression=('SET #status = :new_status, return_reference = :ref, '
+                                  'return_reason = :reason, return_initiated_at = :now, '
+                                  'refund_amount = :amount'),
+                ConditionExpression='#status = :expected_status',
+                ExpressionAttributeNames={'#status': 'status'},
+                ExpressionAttributeValues={
+                    ':new_status':      'return_initiated',
+                    ':expected_status': order['status'],
+                    ':ref':             return_reference,
+                    ':reason':          (reason or 'Customer requested return')[:500],
+                    ':now':             time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+                    ':amount':          str(refund_amount),
+                },
+            )
+        except ClientError as exc:
+            if exc.response['Error']['Code'] == 'ConditionalCheckFailedException':
+                return {'success': False, 'order_id': order_id,
+                        'reason': 'the order changed while the return was being processed - please retry'}
+            raise
+
+        return {
+            'success':            True,
+            'order_id':           order_id,
+            'product_name':       order.get('product_name'),
+            'return_reference':   return_reference,
+            'refund_amount':      f"${refund_amount}",
+            'tier':               tier,
+            'return_window_days': window,
+            'days_since_order':   age,
+            'new_status':         'return_initiated',
+            'instructions': ("A prepaid return label is available in Your Orders. Pack the item "
+                             "with its accessories and drop it off within 14 days. The refund is "
+                             "issued to the original payment method within 5-7 business days "
+                             "of the warehouse receiving the item."),
+        }
 
         
 
