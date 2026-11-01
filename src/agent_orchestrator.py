@@ -58,6 +58,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 # Strands Agents SDK - see: https://github.com/strands-agents/sdk-python
 from strands import Agent
 from strands.models import BedrockModel
+from strands.tools.executors import SequentialToolExecutor
 from boto3.dynamodb.conditions import Key
 from botocore.exceptions import ClientError
 
@@ -307,7 +308,7 @@ def _start_workflow_turn(session_id: str, customer_id: str) -> tuple[dict, str]:
     for attempt in range(3):
         current = _read_workflow_state(session_id) or {}
         # A session belongs to one customer - never let another reuse it
-        if current.get('customer_id') and current['customer_id'] != customer_id:
+        if customer_id and current.get('customer_id') and current['customer_id'] != customer_id:
             raise PermissionError(
                 f"Session {session_id} belongs to a different customer - start a new session.")
         version = int(current.get('version', 0))
@@ -1107,6 +1108,9 @@ Final step - CRITICAL: you NEVER write the customer-facing response yourself. ro
         system_prompt=system_prompt,
         tools=[initialize_session, route_to_inventory_agent, route_to_policy_agent,
                route_to_refund_agent, route_to_communication_agent],
+        # Routing steps depend on each other (initialize -> facts -> decision -> reply),
+        # so they must never run in parallel, even if the model requests several at once.
+        tool_executor=SequentialToolExecutor(),
     )
 # ═══════════════════════════════════════════════════════
 #  AGENT GRAPH HELPERS
