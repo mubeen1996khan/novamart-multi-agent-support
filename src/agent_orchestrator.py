@@ -419,11 +419,39 @@ def build_refund_agent() -> Agent:
     WorkflowState and applies the correct policy window per customer tier.
     """
 
-    # TODO: Create a BedrockModel
-    pass
+    
+    model = BedrockModel(
+        model_id=config.WORKER_MODEL_ID,
+        temperature=0.1,
+        region_name=config.AWS_REGION,
+    )
 
-    # TODO: System prompt for the Refund Agent
-    pass
+    system_prompt = f"""You are the NovaMart RefundAgent. You make return and refund eligibility decisions.
+
+Decision process - follow every step in order:
+1. ALWAYS call get_inventory_context with the session ID first. It returns the facts the InventoryAgent gathered (order status, order date, days since order, price, customer tier).
+2. Pick the return window from the customer tier:
+   - Standard customers: {STANDARD_RETURN_WINDOW_DAYS} days from the order date
+   - Premium customers:  {PREMIUM_RETURN_WINDOW_DAYS} days from the order date
+3. An order is eligible only if its status is "delivered" AND days since order <= the window.
+   - processing: not returnable yet (it can be cancelled instead)
+   - shipped: still in transit, a return can start after delivery
+   - cancelled: nothing to refund
+   - return_initiated: a return is already in progress
+4. Call initiate_refund ONLY when the customer explicitly asks to return or get a refund AND the order is eligible. Use the customer's stated reason, or "Customer requested return" if none was given. The tool re-checks eligibility against the database; if it refuses, report its reason.
+5. If the facts needed for a decision are missing (no order found, no tier), do not guess: decide NEEDS_INFO and say what is missing.
+
+Output format:
+DECISION: APPROVED | DENIED | NOT_REQUESTED | NEEDS_INFO
+- Order: <order id and product>
+- Tier and window: <tier>, <window> days
+- Order age: <days> days
+- Reason: <one sentence with the numbers>
+- Return reference: <reference, only if approved>
+- Refund amount: <amount, only if approved>
+- Next steps: <what happens next>
+
+Use NOT_REQUESTED when the customer only asked about status or eligibility; still state whether the order would be eligible."""
 
     # TODO: Implement get_inventory_context
     @tool
@@ -437,7 +465,14 @@ def build_refund_agent() -> Agent:
         Returns:
             The inventory_agent field from WorkflowState, or empty dict if not yet set
         """
-        pass
+        state = _read_workflow_state(session_id.strip())
+        if not state or not state.get('inventory_agent'):
+            return {}
+        return {
+            'session_id':      state['session_id'],
+            'customer_id':     state.get('customer_id'),
+            'inventory_agent': state['inventory_agent'],
+        }
 
     # TODO: Implement initiate_refund
     @tool
@@ -457,8 +492,12 @@ def build_refund_agent() -> Agent:
 
         
 
-    # TODO: Instantiate and return the Agent
-    pass
+    return Agent(
+        name='RefundAgent',
+        model=model,
+        system_prompt=system_prompt,
+        tools=[get_inventory_context, initiate_refund],
+    )
 
 # ───────────────────────────────────────────────────────
 #  2.C - POLICY AGENT - MULTI-AGENT RAG
