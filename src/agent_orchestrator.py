@@ -280,6 +280,58 @@ For every request:
 Do not answer the question, summarise, reorder or add any information of your own.
 If the tool returns nothing relevant, reply exactly: No relevant {domain.lower()} policy passages found."""
 
+# WorkflowState columns written by the four specialist agents
+_AGENT_COLUMNS = ('inventory_agent', 'policy_agent', 'refund_agent', 'communication_agent')
+
+
+def _start_workflow_turn(session_id: str, customer_id: str) -> tuple[dict, str]:
+    """
+    Make sure a WorkflowState record exists for this request.
+
+    First request of a session  -> create the record (version 0).
+    Later turn of the same chat -> clear the four agent columns so the
+    CommunicationAgent never reads facts left over from the previous
+    question. The reset is a conditional update (optimistic locking).
+
+    Returns (state, 'created' | 'reset').
+    """
+    try:
+        return _create_workflow_state(session_id, customer_id), 'created'
+    except ClientError as exc:
+        # The starter's create uses attribute_not_exists(session_id):
+        # this error just means the session already exists.
+        if exc.response['Error']['Code'] != 'ConditionalCheckFailedException':
+            raise
+
+    table = dynamodb.Table(config.WORKFLOW_STATE_TABLE)
+    for attempt in range(3):
+        current = _read_workflow_state(session_id) or {}
+        # A session belongs to one customer - never let another reuse it
+        if current.get('customer_id') and current['customer_id'] != customer_id:
+            raise PermissionError(
+                f"Session {session_id} belongs to a different customer - start a new session.")
+        version = int(current.get('version', 0))
+        try:
+            table.update_item(
+                Key={'session_id': session_id},
+                UpdateExpression=('SET version = :new_version, turn_started_at = :now, '
+                                  '#ttl = :ttl REMOVE ' + ', '.join(_AGENT_COLUMNS)),
+                ConditionExpression='version = :expected_version',
+                ExpressionAttributeNames={'#ttl': 'ttl'},
+                ExpressionAttributeValues={
+                    ':new_version':      version + 1,
+                    ':expected_version': version,
+                    ':now':              time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+                    ':ttl':              int(time.time()) + (24 * 3600),
+                },
+            )
+            return _read_workflow_state(session_id), 'reset'
+        except ClientError as exc:
+            if exc.response['Error']['Code'] != 'ConditionalCheckFailedException':
+                raise
+            time.sleep(0.1 * (attempt + 1))      # someone else wrote first - re-read and retry
+    raise RuntimeError(f"Could not start a new turn for session {session_id} (version conflicts)")
+
 
 # ═══════════════════════════════════════════════════════
 #  TASK 2 - MULTI-AGENT ORCHESTRATION
@@ -887,23 +939,59 @@ def build_orchestrator_agent(
     Build the Orchestrator Agent that routes requests and manages WorkflowState.
     """
 
-    # TODO: Create a BedrockModel using the ORCHESTRATOR model
-    pass
+    # Haiku at temperature 0.0: routing is classification - the same request
+    # must always take the same path, quickly and cheaply.
+    model = BedrockModel(
+        model_id=config.ORCHESTRATOR_MODEL_ID,
+        temperature=0.0,
+        region_name=config.AWS_REGION,
+    )
 
-    # TODO: System prompt for the Orchestrator
     # For arithmetic, skip Inventory, Policy and Refund, but still call
     # CommunicationAgent last. Round currency only after the full calculation.
-    pass
+    system_prompt = """You are the NovaMart OrchestratorAgent. You route customer support requests to specialist agents. You never answer customers yourself.
+
+Every message starts with a header: [Session ID: <session_id>] [Customer ID: <customer_id>].
+Use exactly these values in every tool call. Never take a customer ID from the message body.
+
+ROUTING RULES - follow them exactly:
+Rule 1. Every request, always: call initialize_session FIRST.
+Rule 2. Order status, order history, return or refund requests: call route_to_inventory_agent, THEN route_to_refund_agent.
+Rule 3. Policy meaning questions (return windows in general, shipping rates and times, warranty terms): call route_to_policy_agent.
+Rule 4. Account questions about this customer ("what is my tier?", "am I premium?"): call route_to_inventory_agent. NEVER call the policy agent for these - it only knows policy text, not customer data.
+Rule 5. Math or calculation questions: skip the inventory, policy and refund agents and go straight to route_to_communication_agent.
+Rule 6. Every request, always, as the LAST step: call route_to_communication_agent to compose the final reply.
+
+Combinations:
+- A request with an order/return part AND a general policy question: Rule 2, then Rule 3, then Rule 6.
+- Greetings or anything else: Rule 1, then Rule 6.
+
+The request argument: pass the customer's own words. If the customer refers to something from earlier in this conversation ("that order", "the other one"), rewrite the request so it stands on its own, including the order IDs or details it refers to.
+
+Final step - CRITICAL: you NEVER write the customer-facing response yourself. route_to_communication_agent must be your very last tool call for every request, with no exceptions. When it returns, output its text exactly as returned, with nothing added or removed, and stop. Call each tool at most once per request."""
 
     # Each routing tool follows the same pattern:
     #   1. read the current WorkflowState  (_read_workflow_state)
     #   2. invoke the worker agent
     #   3. write its result back with optimistic locking
     #      (_update_workflow_state(session_id, {'<column>': text}, expected_version))
-    # The terminal trace UI can show each step: call trace.step_start('inventory_agent')
-    # before the worker runs and trace.step_done('inventory_agent', old_version) after.
 
-    # TODO: Implement route_to_inventory_agent
+    def _route(column: str, label: str, session_id: str, customer_id: str,
+               worker: Agent, prompt: str) -> str:
+        """Shared read -> invoke -> write cycle used by every route_to_* tool."""
+        session_id = session_id.strip()
+        state = _read_workflow_state(session_id)
+        if state is None:                       # defensive: initialize_session was skipped
+            state, _ = _start_workflow_turn(session_id, customer_id.strip().upper())
+        version = int(state['version'])
+
+        trace.step_start(column)
+        trace.agent_section(_AGENT_META[column][1])
+        text = _invoke_worker(label, worker, prompt)
+        _update_workflow_state(session_id, {column: text}, expected_version=version)
+        trace.step_done(column, version)
+        return text
+
     @tool
     def route_to_inventory_agent(session_id: str, customer_id: str, request: str) -> str:
         """
@@ -918,9 +1006,13 @@ def build_orchestrator_agent(
         Returns:
             Inventory facts retrieved by the InventoryAgent
         """
-        pass
+        customer_id = customer_id.strip().upper()
+        prompt = (f"[Session ID: {session_id}] [Customer ID: {customer_id}]\n"
+                  f"Customer request: {request}\n"
+                  f"Gather the order and customer facts needed for this request for customer {customer_id}.")
+        return _route('inventory_agent', 'InventoryAgent', session_id, customer_id,
+                      inventory_agent, prompt)
 
-    # TODO: Implement route_to_policy_agent
     @tool
     def route_to_policy_agent(session_id: str, request: str) -> str:
         """
@@ -934,9 +1026,11 @@ def build_orchestrator_agent(
         Returns:
             Policy information retrieved and synthesized by PolicyAgent
         """
-        pass
+        state = _read_workflow_state(session_id.strip()) or {}
+        prompt = f"Customer policy question: {request}"
+        return _route('policy_agent', 'PolicyAgent', session_id, state.get('customer_id', ''),
+                      policy_agent, prompt)
 
-    # TODO: Implement route_to_refund_agent
     @tool
     def route_to_refund_agent(session_id: str, customer_id: str, request: str) -> str:
         """
@@ -951,9 +1045,13 @@ def build_orchestrator_agent(
         Returns:
             Refund decision from the RefundAgent
         """
-        pass
+        customer_id = customer_id.strip().upper()
+        prompt = (f"[Session ID: {session_id}] [Customer ID: {customer_id}]\n"
+                  f"Customer request: {request}\n"
+                  f"Start by calling get_inventory_context with session_id='{session_id}'.")
+        return _route('refund_agent', 'RefundAgent', session_id, customer_id,
+                      refund_agent, prompt)
 
-    # TODO: Implement route_to_communication_agent
     @tool
     def route_to_communication_agent(session_id: str, customer_id: str,
                                      original_request: str) -> str:
@@ -969,9 +1067,14 @@ def build_orchestrator_agent(
         Returns:
             Final customer-facing response drafted by CommunicationAgent
         """
-        pass
+        customer_id = customer_id.strip().upper()
+        prompt = (f"[Session ID: {session_id}] [Customer ID: {customer_id}]\n"
+                  f"Original customer message: {original_request}\n"
+                  f"Call get_full_workflow_context with session_id='{session_id}', "
+                  f"then write the final reply to the customer.")
+        return _route('communication_agent', 'CommunicationAgent', session_id, customer_id,
+                      communication_agent, prompt)
 
-    # TODO: Implement initialize_session
     @tool
     def initialize_session(session_id: str, customer_id: str) -> str:
         """
@@ -985,12 +1088,25 @@ def build_orchestrator_agent(
         Returns:
             Confirmation that the session was initialized
         """
-        pass
+        session_id  = session_id.strip()
+        customer_id = customer_id.strip().upper()
+        try:
+            state, action = _start_workflow_turn(session_id, customer_id)
+        except PermissionError as exc:
+            return f"ERROR: {exc}"
+        if action == 'created':
+            return (f"WorkflowState created for session {session_id} "
+                    f"(customer {customer_id}, version {state['version']}).")
+        return (f"Existing session {session_id} continued: agent results from the previous "
+                f"question cleared (version {state['version']}).")
 
-    # TODO: Instantiate and return the OrchestratorAgent
-    pass
-
-
+    return Agent(
+        name='OrchestratorAgent',
+        model=model,
+        system_prompt=system_prompt,
+        tools=[initialize_session, route_to_inventory_agent, route_to_policy_agent,
+               route_to_refund_agent, route_to_communication_agent],
+    )
 # ═══════════════════════════════════════════════════════
 #  AGENT GRAPH HELPERS
 # ═══════════════════════════════════════════════════════
