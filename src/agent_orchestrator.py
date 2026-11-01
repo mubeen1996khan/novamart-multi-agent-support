@@ -250,11 +250,40 @@ def _days_since(date_str: str) -> Optional[int]:
     except (TypeError, ValueError):
         return None
     return (datetime.now(timezone.utc).date() - then).days
+
+def _agent_text(result) -> str:
+    """Plain text of a Strands AgentResult, without LLM scaffolding tags."""
+    return _strip_xml_tags(str(result)).strip()
+
+
+def _invoke_worker(label: str, agent: Agent, prompt: str) -> str:
+    """
+    Run a worker agent on a fresh conversation and return its text.
+
+    Worker agents are built once and reused for every request. A Strands
+    Agent keeps its conversation in agent.messages, so without clearing it
+    one customer's facts would stay in context for the next customer.
+    (label names the agent; it is used for metrics in a later step.)
+    """
+    agent.messages.clear()
+    return _agent_text(agent(prompt))
+
+
+def _retriever_prompt(domain: str, tool_name: str) -> str:
+    """System prompt shared by the three retriever sub-agents."""
+    return f"""You are the {domain}PolicyRetrieverAgent for NovaMart.
+
+For every request:
+1. Call {tool_name} exactly once, passing the request as the query.
+2. Return the retrieved passages verbatim, keeping each "Source:" line.
+
+Do not answer the question, summarise, reorder or add any information of your own.
+If the tool returns nothing relevant, reply exactly: No relevant {domain.lower()} policy passages found."""
+
+
 # ═══════════════════════════════════════════════════════
 #  TASK 2 - MULTI-AGENT ORCHESTRATION
 # ═══════════════════════════════════════════════════════
-
-
 # ───────────────────────────────────────────────────────
 #  2.A - INVENTORY AGENT
 # ───────────────────────────────────────────────────────
@@ -596,31 +625,77 @@ def build_policy_agent() -> Agent:
     """
 
     # TODO: Build ReturnsPolicyRetrieverAgent
+    def _retriever_model() -> BedrockModel:
+        # temperature 0.0 - retrieval must be deterministic
+        return BedrockModel(model_id=config.WORKER_MODEL_ID, temperature=0.0,
+                            region_name=config.AWS_REGION)
+
     @tool
     def retrieve_returns_policy(query: str) -> str:
-        """Retrieve relevant passages from the Returns Policy knowledge base."""
-        pass
+        """Retrieve relevant passages from the Returns Policy knowledge base.
+
+         Args:
+            query: The policy question to search for
+
+        Returns:
+            Top matching passages with relevance scores and S3 sources
+        """
+        
+        
 
     # Create the ReturnsPolicyRetrieverAgent with the tool above
-    pass
+        return format_kb_results(retrieve_from_knowledge_base(config.RETURNS_KB_ID, query))
+
+    returns_retriever = Agent(
+        name='ReturnsPolicyRetrieverAgent',
+        model=_retriever_model(),
+        system_prompt=_retriever_prompt('Returns', 'retrieve_returns_policy'),
+        tools=[retrieve_returns_policy],
+    )
 
     # TODO: Build ShippingPolicyRetrieverAgent
     @tool
     def retrieve_shipping_policy(query: str) -> str:
-        """Retrieve relevant passages from the Shipping Policy knowledge base."""
-        pass
+        """Retrieve relevant passages from the Shipping Policy knowledge base.
+
+        Args:
+            query: The policy question to search for
+
+        Returns:
+            Top matching passages with relevance scores and S3 sources"""
+        
 
     # Create the ShippingPolicyRetrieverAgent with the tool above
-    pass
+        return format_kb_results(retrieve_from_knowledge_base(config.SHIPPING_KB_ID, query))
+
+    shipping_retriever = Agent(
+        name='ShippingPolicyRetrieverAgent',
+        model=_retriever_model(),
+        system_prompt=_retriever_prompt('Shipping', 'retrieve_shipping_policy'),
+        tools=[retrieve_shipping_policy],
+    )
 
     # TODO: Build WarrantyPolicyRetrieverAgent
     @tool
     def retrieve_warranty_policy(query: str) -> str:
-        """Retrieve relevant passages from the Warranty Policy knowledge base."""
-        pass
+        """
+        Retrieve relevant passages from the Warranty Policy knowledge base.
 
+        Args:
+            query: The policy question to search for
+
+        Returns:
+            Top matching passages with relevance scores and S3 sources
+        """
     # Create the WarrantyPolicyRetrieverAgent with the tool above
-    pass
+        return format_kb_results(retrieve_from_knowledge_base(config.WARRANTY_KB_ID, query))
+
+    warranty_retriever = Agent(
+        name='WarrantyPolicyRetrieverAgent',
+        model=_retriever_model(),
+        system_prompt=_retriever_prompt('Warranty', 'retrieve_warranty_policy'),
+        tools=[retrieve_warranty_policy],
+    )
 
     # TODO: Implement search_all_policies - parallel RAG retrieval tool
     @tool
