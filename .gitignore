@@ -45,3 +45,7 @@ venv/
 _to_delete/
 .DS_Store
 agentcore/.cli/
+
+# Local submission copies and build output
+submission/
+build/
